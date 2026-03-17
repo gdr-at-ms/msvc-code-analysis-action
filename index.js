@@ -325,6 +325,10 @@ function CompileCommand(group, source) {
     new IncludePath(inc.path, inc.isSystem || false));
   // defines
   this.defines = (group.defines || []).map((d) => d.define);
+  // Path to the CMake dependency scan (.ddi) file for this source, if it exists
+  this.ddiFile = undefined;
+  // Path to the CMake module map (.modmap) file for this source, if it exists
+  this.modmapFile = undefined;
 }
 
 /**
@@ -367,12 +371,139 @@ function loadCompileCommands(replyIndexInfo, buildConfiguration, excludedTargetP
     for (const group of target.compileGroups || []) {
       for (const sourceIndex of group.sourceIndexes) {
         const source = path.join(sourceRoot, target.sources[sourceIndex].path);
-        compileCommands.push(new CompileCommand(group, source));
+        const command = new CompileCommand(group, source);
+        const targetBuildDir = path.join(codemodel.paths.build,
+          codemodelInfo.directories[targetInfo.directoryIndex].build || ".");
+        const objBase = target.sources[sourceIndex].path + ".obj";
+        const cmakeTargetDir = path.join(targetBuildDir, "CMakeFiles",
+          targetInfo.name + ".dir");
+
+        // Look for the CMake dependency scan (.ddi) and module map (.modmap)
+        // files for this source.  CMake generates these at
+        // <target-build-dir>/CMakeFiles/<target>.dir/<source>.obj.{ddi,modmap}
+        const ddiPath = path.join(cmakeTargetDir, objBase + ".ddi");
+        if (fs.existsSync(ddiPath)) {
+          command.ddiFile = ddiPath;
+        }
+
+        const modmapPath = path.join(cmakeTargetDir, objBase + ".modmap");
+        if (fs.existsSync(modmapPath)) {
+          command.modmapFile = modmapPath;
+        }
+
+        compileCommands.push(command);
       }
     }
   }
 
   return compileCommands;
+}
+
+/**
+ * Resolve C++ Modules dependencies from CMake dependency scan (.ddi) files.
+ * Builds a topological ordering so that module providers are analyzed before consumers.
+ * Also adds implicit dependencies: partitions (X:<part>) must be compiled before
+ * their primary module interface (X).
+ * @param {CompileCommand[]} compileCommands list of compile commands with ddiFile paths
+ * @returns {CompileCommand[]} commands in topological dependency order
+ */
+function resolveModuleDependencies(compileCommands) {
+  // Map: module logical name -> source index that provides it
+  const moduleProviders = {};
+  // Map: source index -> { provides: string[], requires: string[] }
+  const sourceDeps = {};
+  let hasModules = false;
+
+  for (let i = 0; i < compileCommands.length; i++) {
+    const command = compileCommands[i];
+    if (!command.ddiFile) continue;
+
+    let ddi;
+    try {
+      ddi = JSON.parse(fs.readFileSync(command.ddiFile, 'utf-8'));
+    } catch (err) {
+      continue;
+    }
+
+    const rule = (ddi.rules || [])[0];
+    if (!rule) continue;
+
+    const provides = (rule.provides || []).map((p) => p['logical-name']);
+    const requires = (rule.requires || []).map((r) => r['logical-name']);
+    sourceDeps[i] = { provides, requires };
+
+    for (const prov of provides) {
+      hasModules = true;
+      moduleProviders[prov] = i;
+    }
+  }
+
+  if (!hasModules) {
+    return compileCommands;
+  }
+
+  // Add implicit partition -> primary dependency.
+  // If source A provides "X" and source B provides "X:<part>", then A depends on B.
+  // CMake's dependency scanner may not capture this.
+  for (const [logicalName, sourceIndex] of Object.entries(moduleProviders)) {
+    if (logicalName.includes(':')) continue; // this is a partition, not a primary
+    // Find all partitions of this module
+    for (const [partName, partIndex] of Object.entries(moduleProviders)) {
+      if (partIndex === sourceIndex) continue;
+      if (partName.startsWith(logicalName + ':')) {
+        // Primary depends on partition
+        const deps = sourceDeps[sourceIndex];
+        if (deps && !deps.requires.includes(partName)) {
+          deps.requires.push(partName);
+        }
+      }
+    }
+  }
+
+  // Topological sort: module providers before their consumers.
+  const n = compileCommands.length;
+  const inDegree = new Array(n).fill(0);
+  const adj = Array.from({ length: n }, () => []);
+
+  for (let i = 0; i < n; i++) {
+    const deps = sourceDeps[i];
+    if (!deps) continue;
+    for (const req of deps.requires) {
+      const providerIndex = moduleProviders[req];
+      if (providerIndex !== undefined && providerIndex !== i) {
+        adj[providerIndex].push(i);
+        inDegree[i]++;
+      }
+    }
+  }
+
+  // Kahn's algorithm
+  const queue = [];
+  for (let i = 0; i < n; i++) {
+    if (inDegree[i] === 0) queue.push(i);
+  }
+
+  const sorted = [];
+  while (queue.length > 0) {
+    const u = queue.shift();
+    sorted.push(u);
+    for (const v of adj[u]) {
+      inDegree[v]--;
+      if (inDegree[v] === 0) queue.push(v);
+    }
+  }
+
+  // Append any remaining nodes not reached by topological sort.
+  // This indicates a cycle in module dependencies, which should not happen.
+  if (sorted.length < n) {
+    const sortedSet = new Set(sorted);
+    for (let i = 0; i < n; i++) {
+      if (!sortedSet.has(i)) sorted.push(i);
+    }
+    core.warning(`Module dependency cycle detected: ${n - sortedSet.size} source(s) could not be topologically ordered.`);
+  }
+
+  return sorted.map((i) => compileCommands[i]);
 }
 
 /**
@@ -579,6 +710,9 @@ async function createAnalysisCommands(buildRoot, options) {
   const toolchainMap = loadToolchainMap(replyIndexInfo);
   const compileCommands = loadCompileCommands(replyIndexInfo, options.buildConfiguration, options.ignoredTargetPaths);
 
+  // Resolve C++ Modules dependencies: topological order for correct analysis sequencing.
+  const orderedCommands = resolveModuleDependencies(compileCommands);
+
   let commonArgsMap = {};
   let commonEnvMap = {};
   for (const toolchain of Object.values(toolchainMap)) {
@@ -589,7 +723,7 @@ async function createAnalysisCommands(buildRoot, options) {
   }
 
   let analyzeCommands = []
-  for (const command of compileCommands) {
+  for (const command of orderedCommands) {
     const toolchain = toolchainMap[command.language];
     if (toolchain) {
       let args = toolrunner.argStringToArray(command.args);
@@ -606,6 +740,14 @@ async function createAnalysisCommands(buildRoot, options) {
 
       for (const define of command.defines) {
         args.push(`/D${define}`);
+      }
+
+      // If this source has a CMake-generated module map (.modmap), pass it
+      // via response file so cl.exe gets the correct -interface, -ifcOutput,
+      // and -reference flags for C++ Modules dependencies.
+      // The modmap must precede the source file in the argument list.
+      if (command.modmapFile) {
+        args.push(`@${command.modmapFile}`);
       }
 
       args.push(command.source);
